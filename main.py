@@ -675,6 +675,37 @@ def reset_monthly_stats(admin_key: str):
     return {"message": "Monthly stats reset"}
 
 
+@app.get("/admin/miners")
+def list_miners(admin_key: str, active_only: bool = False):
+    """List all miners with their stats (admin only)."""
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    with get_db() as db:
+        query = db.query(Wallet)
+        
+        if active_only:
+            cutoff_24h = datetime.utcnow() - timedelta(hours=24)
+            query = query.filter(Wallet.last_share_at > cutoff_24h)
+        
+        wallets = query.order_by(Wallet.month_shares.desc()).all()
+        
+        return [
+            {
+                "wallet": w.address,
+                "total_shares": w.total_shares,
+                "month_shares": w.month_shares,
+                "total_difficulty": w.total_difficulty,
+                "month_difficulty": w.month_difficulty,
+                "pending_sinn": round((w.month_shares / SINN_SHARES_THRESHOLD) * SINN_PAYOUT_AMOUNT, 6),
+                "total_paid": w.total_paid,
+                "last_share_at": w.last_share_at.isoformat() if w.last_share_at else None,
+                "created_at": w.created_at.isoformat() if w.created_at else None
+            }
+            for w in wallets
+        ]
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

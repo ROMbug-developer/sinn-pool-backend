@@ -1,6 +1,7 @@
 """
 SINN Pool Backend - FastAPI + PostgreSQL
-Handles share submission, wallet tracking, and payout calculations
+Handles share submission, wallet tracking, payout calculations, and Hunter authentication
+Version 2.0 - With Hardware Auth
 """
 
 from fastapi import FastAPI, HTTPException
@@ -10,9 +11,11 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 import os
+import secrets
+import struct
 
 # Database
-from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Float, DateTime, func
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Float, DateTime, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -66,6 +69,32 @@ class Payout(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class MiningSession(Base):
+    """Tracks authenticated mining sessions"""
+    __tablename__ = "mining_sessions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    session_token = Column(String(32), unique=True, index=True)
+    wallet = Column(String(64), index=True)
+    boards = Column(String(64))  # Comma-separated board IDs: "1,2,3,4"
+    authenticated_boards = Column(String(64), default="")  # Boards that passed auth
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime)
+    last_activity = Column(DateTime)
+
+
+class PendingChallenge(Base):
+    """Tracks pending authentication challenges"""
+    __tablename__ = "pending_challenges"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    session_token = Column(String(32), index=True)
+    board_id = Column(Integer)
+    challenge = Column(String(8))  # 4 bytes as hex
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime)
+
+
 # Create tables
 Base.metadata.create_all(bind=engine)
 
@@ -73,9 +102,36 @@ Base.metadata.create_all(bind=engine)
 SINN_SHARES_THRESHOLD = 1_000_000
 SINN_PAYOUT_AMOUNT = 96
 MIN_DIFFICULTY = 4096
+SESSION_EXPIRY_MINUTES = 60
 
 # FastAPI app
-app = FastAPI(title="SINN Pool", version="1.0.0")
+app = FastAPI(title="SINN Pool", version="2.0.0")
+
+
+# ============================================================
+#   BOARD AUTHENTICATION FUNCTION (matches SINN firmware)
+#   response = ((SEED * challenge) XOR (SEED + challenge) XOR 0x5A3C9E71)
+#            rotated by (SEED AND 0x1F) bits
+# ============================================================
+def compute_board_response(seed: int, challenge: int) -> int:
+    """
+    Compute authentication response matching SINN firmware.
+    SEED = BOARD_ID (1, 2, 3, etc.)
+    """
+    # Ensure 32-bit operations
+    seed = seed & 0xFFFFFFFF
+    challenge = challenge & 0xFFFFFFFF
+    
+    temp1 = (seed * challenge) & 0xFFFFFFFF
+    temp2 = (seed + challenge) & 0xFFFFFFFF
+    result = temp1 ^ temp2 ^ 0x5A3C9E71
+    
+    # Rotate right by low 5 bits of seed (0-31 positions)
+    rot = seed & 0x1F
+    if rot > 0:
+        result = ((result >> rot) | (result << (32 - rot))) & 0xFFFFFFFF
+    
+    return result
 
 # CORS - allow frontend
 app.add_middleware(
@@ -131,12 +187,413 @@ class PoolStats(BaseModel):
     active_miners_24h: int
 
 
+# Auth models
+class StartSessionRequest(BaseModel):
+    wallet: str
+    boards: list[int]  # List of board IDs connected: [1, 2, 3, 4]
+
+
+class StartSessionResponse(BaseModel):
+    session_token: str
+    message: str
+
+
+class BoardChallengeRequest(BaseModel):
+    session_token: str
+    board_id: int
+
+
+class BoardChallengeResponse(BaseModel):
+    challenge: str  # 8 hex chars (4 bytes)
+    board_id: int
+
+
+class BoardVerifyRequest(BaseModel):
+    session_token: str
+    board_id: int
+    response: str  # 8 hex chars (4 bytes)
+
+
+class BoardVerifyResponse(BaseModel):
+    verified: bool
+    message: str
+
+
+class SessionStatusResponse(BaseModel):
+    valid: bool
+    wallet: Optional[str] = None
+    boards: Optional[list[int]] = None
+    authenticated_boards: Optional[list[int]] = None
+    expires_at: Optional[str] = None
+
+
+class ShareSubmissionAuth(BaseModel):
+    session_token: str
+    wallet: str
+    board_id: int
+    nonce: int
+    hash: str
+    difficulty: int
+    board_id: int
+    nonce: int
+    hash: str
+    difficulty: int
+
+
 @app.get("/")
 def root():
-    return {"status": "SINN Pool Online", "version": "1.0.0"}
+    return {"status": "SINN Pool Online", "version": "2.0.0"}
 
 
-@app.post("/submit_share", response_model=ShareResponse)
+# ============================================================
+#   AUTHENTICATION ENDPOINTS
+# ============================================================
+
+@app.post("/auth/challenge", response_model=AuthChallengeResponse)
+def get_auth_challenge(request: AuthChallengeRequest):
+    """
+    Generate a challenge for Hunter authentication.
+    Frontend sends hunter_id, receives session_token + challenge.
+    """
+    hunter_id = request.hunter_id.lower()
+    
+    # Validate hunter_id format (8 hex chars = 4 bytes)
+    if len(hunter_id) != 8:
+        raise HTTPException(status_code=400, detail="Invalid hunter_id format (need 8 hex chars)")
+    try:
+        bytes.fromhex(hunter_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid hunter_id hex format")
+    
+    with get_db() as db:
+        # Check if hunter exists and is active
+        hunter = db.query(Hunter).filter(Hunter.hunter_id == hunter_id).first()
+        if not hunter:
+            raise HTTPException(status_code=404, detail="Hunter not registered")
+        if not hunter.active:
+            raise HTTPException(status_code=403, detail="Hunter is deactivated")
+        
+        # Generate random challenge and session token
+        challenge = secrets.token_hex(8)  # 8 bytes = 16 hex chars
+        session_token = secrets.token_hex(16)  # 16 bytes = 32 hex chars
+        
+        # Store session
+        expires = datetime.now(timezone.utc) + timedelta(minutes=SESSION_EXPIRY_MINUTES)
+        session = HunterSession(
+            session_token=session_token,
+            hunter_id=hunter_id,
+            challenge=challenge,
+            authenticated=False,
+            expires_at=expires
+        )
+        db.add(session)
+        db.commit()
+        
+        return AuthChallengeResponse(
+            session_token=session_token,
+            challenge=challenge
+        )
+
+
+@app.post("/auth/verify", response_model=AuthVerifyResponse)
+def verify_auth_response(request: AuthVerifyRequest):
+    """
+    Verify Hunter's response to challenge.
+    Marks session as authenticated if correct.
+    """
+    session_token = request.session_token
+    hunter_id = request.hunter_id.lower()
+    response_hex = request.response.lower()
+    
+    # Validate response format (16 hex chars = 8 bytes)
+    if len(response_hex) != 16:
+        raise HTTPException(status_code=400, detail="Invalid response format (need 16 hex chars)")
+    
+    with get_db() as db:
+        # Get session
+        session = db.query(HunterSession).filter(
+            HunterSession.session_token == session_token
+        ).first()
+        
+        if not session:
+            return AuthVerifyResponse(authenticated=False, message="Invalid session")
+        
+        # Check expiry
+        if datetime.now(timezone.utc) > session.expires_at:
+            db.delete(session)
+            db.commit()
+            return AuthVerifyResponse(authenticated=False, message="Session expired")
+        
+        # Check hunter_id matches
+        if session.hunter_id != hunter_id:
+            return AuthVerifyResponse(authenticated=False, message="Hunter ID mismatch")
+        
+        # Get hunter's secret key
+        hunter = db.query(Hunter).filter(Hunter.hunter_id == hunter_id).first()
+        if not hunter:
+            return AuthVerifyResponse(authenticated=False, message="Hunter not found")
+        
+        # Compute expected response
+        secret_key = bytes.fromhex(hunter.secret_key)
+        hunter_id_bytes = bytes.fromhex(hunter_id)
+        challenge_bytes = bytes.fromhex(session.challenge)
+        
+        expected = compute_response(secret_key, hunter_id_bytes, challenge_bytes)
+        expected_hex = expected.hex()
+        
+        # Compare
+        if response_hex != expected_hex:
+            return AuthVerifyResponse(authenticated=False, message="Authentication failed")
+        
+        # Success! Mark session as authenticated and extend expiry
+        session.authenticated = True
+        session.expires_at = datetime.now(timezone.utc) + timedelta(minutes=SESSION_EXPIRY_MINUTES)
+        hunter.last_auth_at = datetime.now(timezone.utc)
+        db.commit()
+        
+        return AuthVerifyResponse(
+            authenticated=True,
+            message="Authentication successful",
+            expires_at=session.expires_at.isoformat()
+        )
+
+
+@app.get("/auth/status/{session_token}")
+def check_auth_status(session_token: str):
+    """Check if a session is still valid and authenticated"""
+    with get_db() as db:
+        session = db.query(HunterSession).filter(
+            HunterSession.session_token == session_token
+        ).first()
+        
+        if not session:
+            return {"valid": False, "authenticated": False, "message": "Session not found"}
+        
+        if datetime.now(timezone.utc) > session.expires_at:
+            return {"valid": False, "authenticated": False, "message": "Session expired"}
+        
+        return {
+            "valid": True,
+            "authenticated": session.authenticated,
+            "hunter_id": session.hunter_id,
+            "expires_at": session.expires_at.isoformat()
+        }
+
+
+@app.post("/submit_share_auth", response_model=ShareResponse)
+def submit_share_authenticated(share: ShareSubmissionAuth):
+    """Submit a share with session authentication"""
+    
+    # Validate session first
+    with get_db() as db:
+        session = db.query(HunterSession).filter(
+            HunterSession.session_token == share.session_token
+        ).first()
+        
+        if not session:
+            return ShareResponse(accepted=False, message="Invalid session")
+        
+        if not session.authenticated:
+            return ShareResponse(accepted=False, message="Session not authenticated")
+        
+        if datetime.now(timezone.utc) > session.expires_at:
+            return ShareResponse(accepted=False, message="Session expired")
+        
+        # Extend session on activity
+        session.expires_at = datetime.now(timezone.utc) + timedelta(minutes=SESSION_EXPIRY_MINUTES)
+        db.commit()
+    
+    # Now process the share (same logic as submit_share)
+    if not share.wallet.startswith("0x") or len(share.wallet) != 42:
+        raise HTTPException(status_code=400, detail="Invalid wallet address")
+    
+    if share.difficulty < MIN_DIFFICULTY:
+        return ShareResponse(
+            accepted=False,
+            message=f"Difficulty {share.difficulty} below minimum {MIN_DIFFICULTY}"
+        )
+    
+    if len(share.hash) != 64:
+        raise HTTPException(status_code=400, detail="Invalid hash format")
+    
+    now = datetime.now(timezone.utc)
+    wallet_lower = share.wallet.lower()
+    
+    with get_db() as db:
+        wallet_row = db.query(Wallet).filter(Wallet.address == wallet_lower).first()
+        
+        if wallet_row is None:
+            wallet_row = Wallet(
+                address=wallet_lower,
+                total_shares=1,
+                total_difficulty=share.difficulty,
+                month_shares=1,
+                month_difficulty=share.difficulty,
+                created_at=now,
+                last_share_at=now,
+            )
+            db.add(wallet_row)
+            new_total = 1
+        else:
+            wallet_row.total_shares += 1
+            wallet_row.total_difficulty += share.difficulty
+            wallet_row.month_shares += 1
+            wallet_row.month_difficulty += share.difficulty
+            wallet_row.last_share_at = now
+            new_total = wallet_row.total_shares
+        
+        new_share = Share(
+            wallet=wallet_lower,
+            board_id=share.board_id,
+            nonce=share.nonce,
+            hash=share.hash,
+            difficulty=share.difficulty,
+            created_at=now,
+        )
+        db.add(new_share)
+        db.commit()
+    
+    pending_sinn = (new_total / SINN_SHARES_THRESHOLD) * SINN_PAYOUT_AMOUNT
+    
+    return ShareResponse(
+        accepted=True,
+        message="Share accepted (authenticated)",
+        total_shares=new_total,
+        pending_sinn=round(pending_sinn, 6)
+    )
+
+
+# ============================================================
+#   ADMIN ENDPOINTS
+# ============================================================
+
+@app.post("/admin/register_hunter", response_model=HunterInfo)
+def register_hunter(request: HunterRegisterRequest, admin_key: str):
+    """Register a new Hunter (admin only)"""
+    
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    hunter_id = request.hunter_id.lower()
+    secret_key = request.secret_key.lower()
+    
+    # Validate formats
+    if len(hunter_id) != 8:
+        raise HTTPException(status_code=400, detail="hunter_id must be 8 hex chars")
+    if len(secret_key) != 32:
+        raise HTTPException(status_code=400, detail="secret_key must be 32 hex chars")
+    
+    try:
+        bytes.fromhex(hunter_id)
+        bytes.fromhex(secret_key)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid hex format")
+    
+    with get_db() as db:
+        # Check if already exists
+        existing = db.query(Hunter).filter(Hunter.hunter_id == hunter_id).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Hunter already registered")
+        
+        hunter = Hunter(
+            hunter_id=hunter_id,
+            secret_key=secret_key,
+            name=request.name,
+            owner=request.owner,
+            active=True
+        )
+        db.add(hunter)
+        db.commit()
+        
+        return HunterInfo(
+            hunter_id=hunter.hunter_id,
+            name=hunter.name,
+            owner=hunter.owner,
+            active=hunter.active,
+            created_at=hunter.created_at.isoformat(),
+            last_auth_at=None
+        )
+
+
+@app.get("/admin/hunters")
+def list_hunters(admin_key: str):
+    """List all registered Hunters (admin only)"""
+    
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    with get_db() as db:
+        hunters = db.query(Hunter).all()
+        return [
+            {
+                "hunter_id": h.hunter_id,
+                "name": h.name,
+                "owner": h.owner,
+                "active": h.active,
+                "created_at": h.created_at.isoformat(),
+                "last_auth_at": h.last_auth_at.isoformat() if h.last_auth_at else None
+            }
+            for h in hunters
+        ]
+
+
+@app.post("/admin/deactivate_hunter")
+def deactivate_hunter(hunter_id: str, admin_key: str):
+    """Deactivate a Hunter (admin only)"""
+    
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    with get_db() as db:
+        hunter = db.query(Hunter).filter(Hunter.hunter_id == hunter_id.lower()).first()
+        if not hunter:
+            raise HTTPException(status_code=404, detail="Hunter not found")
+        
+        hunter.active = False
+        db.commit()
+        
+        return {"message": f"Hunter {hunter_id} deactivated"}
+
+
+@app.post("/admin/generate_hunter")
+def generate_hunter(admin_key: str, name: Optional[str] = None):
+    """Generate a new Hunter with random ID and key (admin only)"""
+    
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    with get_db() as db:
+        # Generate unique hunter_id
+        while True:
+            hunter_id = secrets.token_hex(4)  # 4 bytes = 8 hex chars
+            existing = db.query(Hunter).filter(Hunter.hunter_id == hunter_id).first()
+            if not existing:
+                break
+        
+        # Generate random secret key
+        secret_key = secrets.token_hex(16)  # 16 bytes = 32 hex chars
+        
+        hunter = Hunter(
+            hunter_id=hunter_id,
+            secret_key=secret_key,
+            name=name,
+            active=True
+        )
+        db.add(hunter)
+        db.commit()
+        
+        # Return the secret key ONCE - must be saved for firmware!
+        return {
+            "hunter_id": hunter_id,
+            "secret_key": secret_key,
+            "name": name,
+            "message": "SAVE THE SECRET KEY - it cannot be retrieved later!"
+        }
+
+
+# ============================================================
+#   ORIGINAL SHARE ENDPOINT (kept for backward compatibility)
+# ============================================================
 def submit_share(share: ShareSubmission):
     """Submit a share from a miner"""
     

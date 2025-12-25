@@ -283,7 +283,7 @@ def start_session(request: StartSessionRequest):
             raise HTTPException(status_code=400, detail=f"Invalid board_id: {board_id}")
     
     session_token = secrets.token_hex(16)
-    expires = datetime.now(timezone.utc) + timedelta(minutes=SESSION_EXPIRY_MINUTES)
+    expires = datetime.utcnow() + timedelta(minutes=SESSION_EXPIRY_MINUTES)
     boards_str = ",".join(str(b) for b in request.boards)
     
     with get_db() as db:
@@ -293,7 +293,7 @@ def start_session(request: StartSessionRequest):
             boards=boards_str,
             authenticated_boards="",
             expires_at=expires,
-            last_activity=datetime.now(timezone.utc)
+            last_activity=datetime.utcnow()
         )
         db.add(session)
         db.commit()
@@ -315,7 +315,7 @@ def get_board_challenge(request: BoardChallengeRequest):
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        if datetime.now(timezone.utc) > session.expires_at:
+        if datetime.utcnow() > session.expires_at:
             raise HTTPException(status_code=401, detail="Session expired")
         
         session_boards = [int(b) for b in session.boards.split(",")]
@@ -323,7 +323,7 @@ def get_board_challenge(request: BoardChallengeRequest):
             raise HTTPException(status_code=400, detail=f"Board {request.board_id} not in session")
         
         challenge = secrets.token_hex(4)
-        expires = datetime.now(timezone.utc) + timedelta(minutes=5)
+        expires = datetime.utcnow() + timedelta(minutes=5)
         
         pending = PendingChallenge(
             session_token=request.session_token,
@@ -357,7 +357,7 @@ def verify_board_response(request: BoardVerifyRequest):
         if not pending:
             return BoardVerifyResponse(verified=False, message="No pending challenge for this board")
         
-        if datetime.now(timezone.utc) > pending.expires_at:
+        if datetime.utcnow() > pending.expires_at:
             db.delete(pending)
             db.commit()
             return BoardVerifyResponse(verified=False, message="Challenge expired")
@@ -383,8 +383,8 @@ def verify_board_response(request: BoardVerifyRequest):
             if board_str not in auth_boards:
                 auth_boards.append(board_str)
                 session.authenticated_boards = ",".join(b for b in auth_boards if b)
-            session.last_activity = datetime.now(timezone.utc)
-            session.expires_at = datetime.now(timezone.utc) + timedelta(minutes=SESSION_EXPIRY_MINUTES)
+            session.last_activity = datetime.utcnow()
+            session.expires_at = datetime.utcnow() + timedelta(minutes=SESSION_EXPIRY_MINUTES)
         
         db.commit()
         
@@ -402,7 +402,7 @@ def check_session_status(session_token: str):
         if not session:
             return SessionStatusResponse(valid=False)
         
-        if datetime.now(timezone.utc) > session.expires_at:
+        if datetime.utcnow() > session.expires_at:
             return SessionStatusResponse(valid=False)
         
         boards = [int(b) for b in session.boards.split(",") if b]
@@ -432,7 +432,7 @@ def submit_share_authenticated(share: ShareSubmissionAuth):
         if not session:
             return ShareResponse(accepted=False, message="Invalid session")
         
-        if datetime.now(timezone.utc) > session.expires_at:
+        if datetime.utcnow() > session.expires_at:
             return ShareResponse(accepted=False, message="Session expired")
         
         auth_boards = [int(b) for b in session.authenticated_boards.split(",") if b]
@@ -442,8 +442,8 @@ def submit_share_authenticated(share: ShareSubmissionAuth):
         if share.wallet.lower() != session.wallet:
             return ShareResponse(accepted=False, message="Wallet mismatch")
         
-        session.expires_at = datetime.now(timezone.utc) + timedelta(minutes=SESSION_EXPIRY_MINUTES)
-        session.last_activity = datetime.now(timezone.utc)
+        session.expires_at = datetime.utcnow() + timedelta(minutes=SESSION_EXPIRY_MINUTES)
+        session.last_activity = datetime.utcnow()
         db.commit()
     
     if not share.wallet.startswith("0x") or len(share.wallet) != 42:
@@ -458,7 +458,7 @@ def submit_share_authenticated(share: ShareSubmissionAuth):
     if len(share.hash) != 64:
         raise HTTPException(status_code=400, detail="Invalid hash format")
     
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     wallet_lower = share.wallet.lower()
     
     with get_db() as db:
@@ -520,7 +520,7 @@ def submit_share(share: ShareSubmission):
     if len(share.hash) != 64:
         raise HTTPException(status_code=400, detail="Invalid hash format")
     
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     wallet_lower = share.wallet.lower()
     
     with get_db() as db:
@@ -617,7 +617,7 @@ def get_pool_stats():
             func.sum(Wallet.month_shares)
         ).first()
         
-        cutoff_24h = datetime.now(timezone.utc) - timedelta(hours=24)
+        cutoff_24h = datetime.utcnow() - timedelta(hours=24)
         active_miners = db.query(Wallet).filter(
             Wallet.last_share_at > cutoff_24h
         ).count()
@@ -643,7 +643,7 @@ def list_sessions(admin_key: str):
     
     with get_db() as db:
         sessions = db.query(MiningSession).filter(
-            MiningSession.expires_at > datetime.now(timezone.utc)
+            MiningSession.expires_at > datetime.utcnow()
         ).all()
         
         return [

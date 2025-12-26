@@ -98,6 +98,19 @@ class PendingChallenge(Base):
     expires_at = Column(DateTime)
 
 
+class RegisteredBoard(Base):
+    """Registered SINN boards with their unique SEEDs"""
+    __tablename__ = "registered_boards"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    board_id = Column(Integer, index=True)
+    mb_id = Column(Integer, default=1)
+    seed = Column(BigInteger)  # 32-bit random seed
+    serial = Column(String(32), unique=True, index=True)
+    registered_at = Column(DateTime, default=datetime.utcnow)
+    active = Column(Boolean, default=True)
+
+
 # Create tables
 Base.metadata.create_all(bind=engine)
 
@@ -137,7 +150,7 @@ def compute_board_response(seed: int, challenge: int) -> int:
     Compute authentication response matching SINN firmware.
     response = ((SEED * challenge) XOR (SEED + challenge) XOR 0x5A3C9E71)
              rotated right by (SEED AND 0x1F) bits
-    SEED = BOARD_ID (1, 2, 3, etc.)
+    SEED = unique random value per board (looked up from database)
     """
     seed = seed & 0xFFFFFFFF
     challenge = challenge & 0xFFFFFFFF
@@ -362,7 +375,18 @@ def verify_board_response(request: BoardVerifyRequest):
             db.commit()
             return BoardVerifyResponse(verified=False, message="Challenge expired")
         
-        seed = request.board_id
+        # Look up seed from registered boards
+        registered = db.query(RegisteredBoard).filter(
+            RegisteredBoard.board_id == request.board_id,
+            RegisteredBoard.active == True
+        ).first()
+        
+        if not registered:
+            db.delete(pending)
+            db.commit()
+            return BoardVerifyResponse(verified=False, message=f"Board {request.board_id} not registered")
+        
+        seed = registered.seed
         challenge = int(pending.challenge, 16)
         expected = compute_board_response(seed, challenge)
         expected_hex = f"{expected:08x}"
@@ -704,6 +728,113 @@ def list_miners(admin_key: str, active_only: bool = False):
             }
             for w in wallets
         ]
+
+
+# ============================================================
+#   BOARD REGISTRATION ENDPOINTS
+# ============================================================
+
+class BoardRegistration(BaseModel):
+    board_id: int
+    mb_id: int
+    seed: int
+    serial: str
+
+
+@app.post("/admin/register_board")
+def register_board(board: BoardRegistration, admin_key: str):
+    """Register a new SINN board with its unique SEED (admin only)."""
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    if board.board_id < 1 or board.board_id > 255:
+        raise HTTPException(status_code=400, detail="Board ID must be 1-255")
+    
+    if board.mb_id < 1 or board.mb_id > 255:
+        raise HTTPException(status_code=400, detail="MB ID must be 1-255")
+    
+    if board.seed < 1 or board.seed > 0xFFFFFFFF:
+        raise HTTPException(status_code=400, detail="Seed must be 1 to 4294967295")
+    
+    with get_db() as db:
+        # Check if serial already exists
+        existing = db.query(RegisteredBoard).filter(
+            RegisteredBoard.serial == board.serial
+        ).first()
+        
+        if existing:
+            raise HTTPException(status_code=400, detail=f"Serial {board.serial} already registered")
+        
+        # Check if board_id + mb_id combo already exists
+        existing_board = db.query(RegisteredBoard).filter(
+            RegisteredBoard.board_id == board.board_id,
+            RegisteredBoard.mb_id == board.mb_id
+        ).first()
+        
+        if existing_board:
+            raise HTTPException(status_code=400, 
+                detail=f"Board {board.mb_id}:{board.board_id} already registered as {existing_board.serial}")
+        
+        new_board = RegisteredBoard(
+            board_id=board.board_id,
+            mb_id=board.mb_id,
+            seed=board.seed,
+            serial=board.serial,
+            active=True
+        )
+        db.add(new_board)
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": f"Board {board.serial} registered",
+            "board_id": board.board_id,
+            "mb_id": board.mb_id
+        }
+
+
+@app.get("/admin/registered_boards")
+def list_registered_boards(admin_key: str):
+    """List all registered boards (admin only)."""
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    with get_db() as db:
+        boards = db.query(RegisteredBoard).order_by(
+            RegisteredBoard.mb_id, RegisteredBoard.board_id
+        ).all()
+        
+        return [
+            {
+                "serial": b.serial,
+                "board_id": b.board_id,
+                "mb_id": b.mb_id,
+                "seed_hex": f"0x{b.seed:08X}",
+                "registered_at": b.registered_at.isoformat() if b.registered_at else None,
+                "active": b.active
+            }
+            for b in boards
+        ]
+
+
+@app.delete("/admin/unregister_board")
+def unregister_board(serial: str, admin_key: str):
+    """Unregister a board by serial (admin only)."""
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    with get_db() as db:
+        board = db.query(RegisteredBoard).filter(
+            RegisteredBoard.serial == serial
+        ).first()
+        
+        if not board:
+            raise HTTPException(status_code=404, detail=f"Board {serial} not found")
+        
+        db.delete(board)
+        db.commit()
+        
+        return {"success": True, "message": f"Board {serial} unregistered"}
 
 
 if __name__ == "__main__":

@@ -79,8 +79,9 @@ class MiningSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     session_token = Column(String(32), unique=True, index=True)
     wallet = Column(String(64), index=True)
+    system_id = Column(Integer, index=True)  # Sentinel/Motherboard system ID
     boards = Column(String(64))  # Comma-separated board IDs: "1,2,3,4"
-    authenticated_boards = Column(String(64), default="")  # Boards that passed auth
+    authenticated_boards = Column(String(256), default="")  # Format: "mb:board,mb:board"
     created_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime)
     last_activity = Column(DateTime)
@@ -92,6 +93,8 @@ class PendingChallenge(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     session_token = Column(String(32), index=True)
+    system_id = Column(Integer)
+    mb_id = Column(Integer)
     board_id = Column(Integer)
     challenge = Column(String(8))  # 4 bytes as hex
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -103,8 +106,9 @@ class RegisteredBoard(Base):
     __tablename__ = "registered_boards"
     
     id = Column(Integer, primary_key=True, index=True)
-    board_id = Column(Integer, index=True)
+    system_id = Column(Integer, index=True)  # Unique per Sentinel/Motherboard
     mb_id = Column(Integer, default=1)
+    board_id = Column(Integer, index=True)
     seed = Column(BigInteger)  # 32-bit random seed
     serial = Column(String(32), unique=True, index=True)
     registered_at = Column(DateTime, default=datetime.utcnow)
@@ -221,6 +225,7 @@ class PoolStats(BaseModel):
 # Auth models
 class StartSessionRequest(BaseModel):
     wallet: str
+    system_id: int  # Sentinel/Motherboard system ID
     boards: list[int]
 
 
@@ -231,16 +236,22 @@ class StartSessionResponse(BaseModel):
 
 class BoardChallengeRequest(BaseModel):
     session_token: str
+    system_id: int
+    mb_id: int
     board_id: int
 
 
 class BoardChallengeResponse(BaseModel):
     challenge: str
+    system_id: int
+    mb_id: int
     board_id: int
 
 
 class BoardVerifyRequest(BaseModel):
     session_token: str
+    system_id: int
+    mb_id: int
     board_id: int
     response: str
 
@@ -253,6 +264,7 @@ class BoardVerifyResponse(BaseModel):
 class SessionStatusResponse(BaseModel):
     valid: bool
     wallet: Optional[str] = None
+    system_id: Optional[int] = None
     boards: Optional[list[int]] = None
     authenticated_boards: Optional[list[int]] = None
     expires_at: Optional[str] = None
@@ -261,6 +273,8 @@ class SessionStatusResponse(BaseModel):
 class ShareSubmissionAuth(BaseModel):
     session_token: str
     wallet: str
+    system_id: int
+    mb_id: int
     board_id: int
     nonce: int
     hash: str
@@ -282,11 +296,14 @@ def root():
 
 @app.post("/auth/start_session", response_model=StartSessionResponse)
 def start_session(request: StartSessionRequest):
-    """Start a mining session with wallet and board list."""
+    """Start a mining session with wallet, system_id and board list."""
     wallet = request.wallet.lower()
     
     if not wallet.startswith("0x") or len(wallet) != 42:
         raise HTTPException(status_code=400, detail="Invalid wallet address")
+    
+    if request.system_id < 1 or request.system_id > 65535:
+        raise HTTPException(status_code=400, detail="Invalid system_id (1-65535)")
     
     if not request.boards or len(request.boards) == 0:
         raise HTTPException(status_code=400, detail="No boards specified")
@@ -303,6 +320,7 @@ def start_session(request: StartSessionRequest):
         session = MiningSession(
             session_token=session_token,
             wallet=wallet,
+            system_id=request.system_id,
             boards=boards_str,
             authenticated_boards="",
             expires_at=expires,
@@ -313,7 +331,7 @@ def start_session(request: StartSessionRequest):
     
     return StartSessionResponse(
         session_token=session_token,
-        message=f"Session started with boards: {boards_str}"
+        message=f"Session started for system {request.system_id} with boards: {boards_str}"
     )
 
 
@@ -331,6 +349,10 @@ def get_board_challenge(request: BoardChallengeRequest):
         if datetime.utcnow() > session.expires_at:
             raise HTTPException(status_code=401, detail="Session expired")
         
+        # Verify system_id matches session
+        if session.system_id != request.system_id:
+            raise HTTPException(status_code=400, detail="System ID mismatch")
+        
         session_boards = [int(b) for b in session.boards.split(",")]
         if request.board_id not in session_boards:
             raise HTTPException(status_code=400, detail=f"Board {request.board_id} not in session")
@@ -340,6 +362,8 @@ def get_board_challenge(request: BoardChallengeRequest):
         
         pending = PendingChallenge(
             session_token=request.session_token,
+            system_id=request.system_id,
+            mb_id=request.mb_id,
             board_id=request.board_id,
             challenge=challenge,
             expires_at=expires
@@ -349,6 +373,8 @@ def get_board_challenge(request: BoardChallengeRequest):
         
         return BoardChallengeResponse(
             challenge=challenge,
+            system_id=request.system_id,
+            mb_id=request.mb_id,
             board_id=request.board_id
         )
 
@@ -364,6 +390,8 @@ def verify_board_response(request: BoardVerifyRequest):
     with get_db() as db:
         pending = db.query(PendingChallenge).filter(
             PendingChallenge.session_token == request.session_token,
+            PendingChallenge.system_id == request.system_id,
+            PendingChallenge.mb_id == request.mb_id,
             PendingChallenge.board_id == request.board_id
         ).first()
         
@@ -375,8 +403,10 @@ def verify_board_response(request: BoardVerifyRequest):
             db.commit()
             return BoardVerifyResponse(verified=False, message="Challenge expired")
         
-        # Look up seed from registered boards
+        # Look up seed from registered boards by (system_id, mb_id, board_id)
         registered = db.query(RegisteredBoard).filter(
+            RegisteredBoard.system_id == request.system_id,
+            RegisteredBoard.mb_id == request.mb_id,
             RegisteredBoard.board_id == request.board_id,
             RegisteredBoard.active == True
         ).first()
@@ -384,7 +414,7 @@ def verify_board_response(request: BoardVerifyRequest):
         if not registered:
             db.delete(pending)
             db.commit()
-            return BoardVerifyResponse(verified=False, message=f"Board {request.board_id} not registered")
+            return BoardVerifyResponse(verified=False, message=f"Board {request.system_id}:{request.mb_id}:{request.board_id} not registered")
         
         seed = registered.seed
         challenge = int(pending.challenge, 16)
@@ -402,8 +432,9 @@ def verify_board_response(request: BoardVerifyRequest):
         ).first()
         
         if session:
+            # Store as "mb:board" format
             auth_boards = session.authenticated_boards.split(",") if session.authenticated_boards else []
-            board_str = str(request.board_id)
+            board_str = f"{request.mb_id}:{request.board_id}"
             if board_str not in auth_boards:
                 auth_boards.append(board_str)
                 session.authenticated_boards = ",".join(b for b in auth_boards if b)
@@ -412,7 +443,7 @@ def verify_board_response(request: BoardVerifyRequest):
         
         db.commit()
         
-        return BoardVerifyResponse(verified=True, message=f"Board {request.board_id} authenticated")
+        return BoardVerifyResponse(verified=True, message=f"Board {request.mb_id}:{request.board_id} authenticated")
 
 
 @app.get("/auth/status/{session_token}", response_model=SessionStatusResponse)
@@ -459,9 +490,15 @@ def submit_share_authenticated(share: ShareSubmissionAuth):
         if datetime.utcnow() > session.expires_at:
             return ShareResponse(accepted=False, message="Session expired")
         
-        auth_boards = [int(b) for b in session.authenticated_boards.split(",") if b]
-        if share.board_id not in auth_boards:
-            return ShareResponse(accepted=False, message=f"Board {share.board_id} not authenticated")
+        # Verify system_id matches session
+        if session.system_id != share.system_id:
+            return ShareResponse(accepted=False, message="System ID mismatch")
+        
+        # Check if board is authenticated (format: "mb:board")
+        auth_boards = [b for b in session.authenticated_boards.split(",") if b]
+        board_key = f"{share.mb_id}:{share.board_id}"
+        if board_key not in auth_boards:
+            return ShareResponse(accepted=False, message=f"Board {board_key} not authenticated")
         
         if share.wallet.lower() != session.wallet:
             return ShareResponse(accepted=False, message="Wallet mismatch")
@@ -739,45 +776,63 @@ class BoardRegistration(BaseModel):
     mb_id: int
     seed: int
     serial: str
+    chip_type: str = "MX170"  # Optional chip type
 
 
 @app.post("/admin/register_board")
 def register_board(board: BoardRegistration, admin_key: str):
-    """Register a new SINN board with its unique SEED (admin only)."""
+    """Register a new SINN board with its unique SEED (admin only).
+    Supports UPSERT - will update seed/serial if board already exists.
+    """
     if admin_key != os.getenv("ADMIN_KEY", ""):
         raise HTTPException(status_code=403, detail="Unauthorized")
     
-    if board.board_id < 1 or board.board_id > 255:
-        raise HTTPException(status_code=400, detail="Board ID must be 1-255")
-    
     if board.mb_id < 1 or board.mb_id > 255:
         raise HTTPException(status_code=400, detail="MB ID must be 1-255")
+    
+    if board.board_id < 1 or board.board_id > 255:
+        raise HTTPException(status_code=400, detail="Board ID must be 1-255")
     
     if board.seed < 1 or board.seed > 0xFFFFFFFF:
         raise HTTPException(status_code=400, detail="Seed must be 1 to 4294967295")
     
     with get_db() as db:
-        # Check if serial already exists
-        existing = db.query(RegisteredBoard).filter(
-            RegisteredBoard.serial == board.serial
-        ).first()
-        
-        if existing:
-            raise HTTPException(status_code=400, detail=f"Serial {board.serial} already registered")
-        
-        # Check if board_id + mb_id combo already exists
+        # Check if mb_id + board_id combo already exists (UPSERT)
         existing_board = db.query(RegisteredBoard).filter(
-            RegisteredBoard.board_id == board.board_id,
-            RegisteredBoard.mb_id == board.mb_id
+            RegisteredBoard.mb_id == board.mb_id,
+            RegisteredBoard.board_id == board.board_id
         ).first()
         
         if existing_board:
-            raise HTTPException(status_code=400, 
-                detail=f"Board {board.mb_id}:{board.board_id} already registered as {existing_board.serial}")
+            # UPDATE existing board with new seed/serial
+            old_serial = existing_board.serial
+            existing_board.seed = board.seed
+            existing_board.serial = board.serial
+            existing_board.active = True
+            db.commit()
+            
+            return {
+                "success": True,
+                "message": f"Board {board.mb_id}:{board.board_id} updated (was {old_serial}, now {board.serial})",
+                "mb_id": board.mb_id,
+                "board_id": board.board_id,
+                "updated": True
+            }
         
+        # Check if serial already exists on a DIFFERENT board
+        existing_serial = db.query(RegisteredBoard).filter(
+            RegisteredBoard.serial == board.serial
+        ).first()
+        
+        if existing_serial:
+            raise HTTPException(status_code=400, 
+                detail=f"Serial {board.serial} already used by board {existing_serial.mb_id}:{existing_serial.board_id}")
+        
+        # INSERT new board
         new_board = RegisteredBoard(
-            board_id=board.board_id,
+            system_id=1,  # Default system_id for backwards compatibility
             mb_id=board.mb_id,
+            board_id=board.board_id,
             seed=board.seed,
             serial=board.serial,
             active=True
@@ -788,8 +843,8 @@ def register_board(board: BoardRegistration, admin_key: str):
         return {
             "success": True,
             "message": f"Board {board.serial} registered",
-            "board_id": board.board_id,
-            "mb_id": board.mb_id
+            "mb_id": board.mb_id,
+            "board_id": board.board_id
         }
 
 
@@ -807,8 +862,8 @@ def list_registered_boards(admin_key: str):
         return [
             {
                 "serial": b.serial,
-                "board_id": b.board_id,
                 "mb_id": b.mb_id,
+                "board_id": b.board_id,
                 "seed_hex": f"0x{b.seed:08X}",
                 "registered_at": b.registered_at.isoformat() if b.registered_at else None,
                 "active": b.active

@@ -92,7 +92,7 @@ class PendingChallenge(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     session_token = Column(String(32), index=True)
-    mb_id = Column(Integer)
+    mb_id = Column(Integer, default=1)
     board_id = Column(Integer)
     challenge = Column(String(8))  # 4 bytes as hex
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -232,8 +232,8 @@ class StartSessionResponse(BaseModel):
 
 class BoardChallengeRequest(BaseModel):
     session_token: str
-    mb_id: int
     board_id: int
+    mb_id: int = 1
 
 
 class BoardChallengeResponse(BaseModel):
@@ -244,9 +244,9 @@ class BoardChallengeResponse(BaseModel):
 
 class BoardVerifyRequest(BaseModel):
     session_token: str
-    mb_id: int
     board_id: int
     response: str
+    mb_id: int = 1
 
 
 class BoardVerifyResponse(BaseModel):
@@ -265,11 +265,11 @@ class SessionStatusResponse(BaseModel):
 class ShareSubmissionAuth(BaseModel):
     session_token: str
     wallet: str
-    mb_id: int
     board_id: int
     nonce: int
     hash: str
     difficulty: int
+    mb_id: int = 1
 
 
 # ============================================================

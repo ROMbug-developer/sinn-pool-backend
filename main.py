@@ -224,7 +224,6 @@ class PoolStats(BaseModel):
 # Auth models
 class StartSessionRequest(BaseModel):
     wallet: str
-    system_id: int  # Sentinel/Motherboard system ID
     boards: list[int]
 
 
@@ -235,21 +234,18 @@ class StartSessionResponse(BaseModel):
 
 class BoardChallengeRequest(BaseModel):
     session_token: str
-    system_id: int
     mb_id: int
     board_id: int
 
 
 class BoardChallengeResponse(BaseModel):
     challenge: str
-    system_id: int
     mb_id: int
     board_id: int
 
 
 class BoardVerifyRequest(BaseModel):
     session_token: str
-    system_id: int
     mb_id: int
     board_id: int
     response: str
@@ -263,7 +259,6 @@ class BoardVerifyResponse(BaseModel):
 class SessionStatusResponse(BaseModel):
     valid: bool
     wallet: Optional[str] = None
-    system_id: Optional[int] = None
     boards: Optional[list[int]] = None
     authenticated_boards: Optional[list[int]] = None
     expires_at: Optional[str] = None
@@ -272,7 +267,6 @@ class SessionStatusResponse(BaseModel):
 class ShareSubmissionAuth(BaseModel):
     session_token: str
     wallet: str
-    system_id: int
     mb_id: int
     board_id: int
     nonce: int
@@ -295,14 +289,11 @@ def root():
 
 @app.post("/auth/start_session", response_model=StartSessionResponse)
 def start_session(request: StartSessionRequest):
-    """Start a mining session with wallet, system_id and board list."""
+    """Start a mining session with wallet and board list."""
     wallet = request.wallet.lower()
     
     if not wallet.startswith("0x") or len(wallet) != 42:
         raise HTTPException(status_code=400, detail="Invalid wallet address")
-    
-    if request.system_id < 1 or request.system_id > 65535:
-        raise HTTPException(status_code=400, detail="Invalid system_id (1-65535)")
     
     if not request.boards or len(request.boards) == 0:
         raise HTTPException(status_code=400, detail="No boards specified")
@@ -319,7 +310,7 @@ def start_session(request: StartSessionRequest):
         session = MiningSession(
             session_token=session_token,
             wallet=wallet,
-            system_id=request.system_id,
+            system_id=1,
             boards=boards_str,
             authenticated_boards="",
             expires_at=expires,
@@ -330,7 +321,7 @@ def start_session(request: StartSessionRequest):
     
     return StartSessionResponse(
         session_token=session_token,
-        message=f"Session started for system {request.system_id} with boards: {boards_str}"
+        message=f"Session started with boards: {boards_str}"
     )
 
 
@@ -348,10 +339,6 @@ def get_board_challenge(request: BoardChallengeRequest):
         if datetime.utcnow() > session.expires_at:
             raise HTTPException(status_code=401, detail="Session expired")
         
-        # Verify system_id matches session
-        if session.system_id != request.system_id:
-            raise HTTPException(status_code=400, detail="System ID mismatch")
-        
         session_boards = [int(b) for b in session.boards.split(",")]
         if request.board_id not in session_boards:
             raise HTTPException(status_code=400, detail=f"Board {request.board_id} not in session")
@@ -361,7 +348,7 @@ def get_board_challenge(request: BoardChallengeRequest):
         
         pending = PendingChallenge(
             session_token=request.session_token,
-            system_id=request.system_id,
+            system_id=1,
             mb_id=request.mb_id,
             board_id=request.board_id,
             challenge=challenge,
@@ -372,7 +359,6 @@ def get_board_challenge(request: BoardChallengeRequest):
         
         return BoardChallengeResponse(
             challenge=challenge,
-            system_id=request.system_id,
             mb_id=request.mb_id,
             board_id=request.board_id
         )
@@ -389,7 +375,6 @@ def verify_board_response(request: BoardVerifyRequest):
     with get_db() as db:
         pending = db.query(PendingChallenge).filter(
             PendingChallenge.session_token == request.session_token,
-            PendingChallenge.system_id == request.system_id,
             PendingChallenge.mb_id == request.mb_id,
             PendingChallenge.board_id == request.board_id
         ).first()
@@ -487,10 +472,6 @@ def submit_share_authenticated(share: ShareSubmissionAuth):
         
         if datetime.utcnow() > session.expires_at:
             return ShareResponse(accepted=False, message="Session expired")
-        
-        # Verify system_id matches session
-        if session.system_id != share.system_id:
-            return ShareResponse(accepted=False, message="System ID mismatch")
         
         # Check if board is authenticated (format: "mb:board")
         auth_boards = [b for b in session.authenticated_boards.split(",") if b]

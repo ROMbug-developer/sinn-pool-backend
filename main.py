@@ -79,7 +79,6 @@ class MiningSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     session_token = Column(String(32), unique=True, index=True)
     wallet = Column(String(64), index=True)
-    system_id = Column(Integer, index=True)  # Sentinel/Motherboard system ID
     boards = Column(String(64))  # Comma-separated board IDs: "1,2,3,4"
     authenticated_boards = Column(String(256), default="")  # Format: "mb:board,mb:board"
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -93,7 +92,6 @@ class PendingChallenge(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     session_token = Column(String(32), index=True)
-    system_id = Column(Integer)
     mb_id = Column(Integer)
     board_id = Column(Integer)
     challenge = Column(String(8))  # 4 bytes as hex
@@ -310,7 +308,6 @@ def start_session(request: StartSessionRequest):
         session = MiningSession(
             session_token=session_token,
             wallet=wallet,
-            system_id=1,
             boards=boards_str,
             authenticated_boards="",
             expires_at=expires,
@@ -348,7 +345,6 @@ def get_board_challenge(request: BoardChallengeRequest):
         
         pending = PendingChallenge(
             session_token=request.session_token,
-            system_id=1,
             mb_id=request.mb_id,
             board_id=request.board_id,
             challenge=challenge,

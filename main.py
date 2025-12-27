@@ -106,7 +106,6 @@ class RegisteredBoard(Base):
     __tablename__ = "registered_boards"
     
     id = Column(Integer, primary_key=True, index=True)
-    system_id = Column(Integer, index=True)  # Unique per Sentinel/Motherboard
     mb_id = Column(Integer, default=1)
     board_id = Column(Integer, index=True)
     seed = Column(BigInteger)  # 32-bit random seed
@@ -403,9 +402,8 @@ def verify_board_response(request: BoardVerifyRequest):
             db.commit()
             return BoardVerifyResponse(verified=False, message="Challenge expired")
         
-        # Look up seed from registered boards by (system_id, mb_id, board_id)
+        # Look up seed from registered boards by (mb_id, board_id)
         registered = db.query(RegisteredBoard).filter(
-            RegisteredBoard.system_id == request.system_id,
             RegisteredBoard.mb_id == request.mb_id,
             RegisteredBoard.board_id == request.board_id,
             RegisteredBoard.active == True
@@ -414,7 +412,7 @@ def verify_board_response(request: BoardVerifyRequest):
         if not registered:
             db.delete(pending)
             db.commit()
-            return BoardVerifyResponse(verified=False, message=f"Board {request.system_id}:{request.mb_id}:{request.board_id} not registered")
+            return BoardVerifyResponse(verified=False, message=f"Board {request.mb_id}:{request.board_id} not registered")
         
         seed = registered.seed
         challenge = int(pending.challenge, 16)
@@ -830,7 +828,6 @@ def register_board(board: BoardRegistration, admin_key: str):
         
         # INSERT new board
         new_board = RegisteredBoard(
-            system_id=1,  # Default system_id for backwards compatibility
             mb_id=board.mb_id,
             board_id=board.board_id,
             seed=board.seed,

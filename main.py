@@ -1,7 +1,7 @@
 """
 SINN Pool Backend - FastAPI + PostgreSQL
 Handles share submission, wallet tracking, payout calculations, and board authentication
-Version 2.0 - Board-level Hardware Auth
+Version 2.1 - Smart Payout Processing with Carry-Over
 """
 
 from fastapi import FastAPI, HTTPException
@@ -130,7 +130,7 @@ SESSION_EXPIRY_MINUTES = 60
 #   FASTAPI APP
 # ============================================================
 
-app = FastAPI(title="SINN Pool", version="2.0.0")
+app = FastAPI(title="SINN Pool", version="2.1.0")
 
 # CORS - allow frontend
 app.add_middleware(
@@ -697,7 +697,7 @@ def list_sessions(admin_key: str):
 
 @app.post("/admin/reset_monthly")
 def reset_monthly_stats(admin_key: str):
-    """Reset monthly stats for all wallets (admin only)."""
+    """Reset monthly stats for all wallets (admin only). WARNING: Loses carry-over shares."""
     if admin_key != os.getenv("ADMIN_KEY", ""):
         raise HTTPException(status_code=403, detail="Unauthorized")
     
@@ -709,6 +709,95 @@ def reset_monthly_stats(admin_key: str):
         db.commit()
     
     return {"message": "Monthly stats reset"}
+
+
+@app.post("/admin/process_payouts")
+def process_payouts(admin_key: str, dry_run: bool = True):
+    """
+    Process monthly payouts - preserves carry-over shares.
+    
+    - Finds wallets with month_shares >= threshold
+    - Calculates payouts earned (floor division)
+    - Subtracts only shares_used, keeps remainder
+    - Creates Payout records
+    
+    Args:
+        admin_key: Admin authentication key
+        dry_run: If True, only calculates without modifying database (default: True)
+    
+    Returns:
+        List of payouts processed/to be processed
+    """
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    payout_month = datetime.utcnow().strftime("%Y-%m")
+    
+    with get_db() as db:
+        # Find all wallets meeting threshold
+        wallets = db.query(Wallet).filter(
+            Wallet.month_shares >= SINN_SHARES_THRESHOLD
+        ).all()
+        
+        if not wallets:
+            return {
+                "message": "No wallets qualify for payout",
+                "dry_run": dry_run,
+                "total_wallets": 0,
+                "total_sinn": 0,
+                "payouts": []
+            }
+        
+        payouts_list = []
+        total_sinn = 0
+        total_shares_used = 0
+        
+        for wallet in wallets:
+            # Calculate payouts earned (supports multiple threshold hits)
+            payouts_earned = wallet.month_shares // SINN_SHARES_THRESHOLD
+            sinn_to_pay = payouts_earned * SINN_PAYOUT_AMOUNT
+            shares_used = payouts_earned * SINN_SHARES_THRESHOLD
+            shares_remaining = wallet.month_shares - shares_used
+            
+            payout_info = {
+                "wallet": wallet.address,
+                "month_shares": wallet.month_shares,
+                "payouts_earned": payouts_earned,
+                "sinn_to_pay": sinn_to_pay,
+                "shares_used": shares_used,
+                "shares_remaining": shares_remaining
+            }
+            payouts_list.append(payout_info)
+            total_sinn += sinn_to_pay
+            total_shares_used += shares_used
+            
+            if not dry_run:
+                # Update wallet - subtract only shares_used, preserve remainder
+                wallet.month_shares = shares_remaining
+                wallet.month_difficulty = 0  # Reset difficulty for new month
+                
+                # Create payout record
+                payout_record = Payout(
+                    wallet=wallet.address,
+                    amount=sinn_to_pay,
+                    month=payout_month,
+                    shares_count=shares_used,
+                    tx_hash=None  # To be filled after manual transfer
+                )
+                db.add(payout_record)
+        
+        if not dry_run:
+            db.commit()
+        
+        return {
+            "message": "Payouts processed" if not dry_run else "Dry run complete - no changes made",
+            "dry_run": dry_run,
+            "payout_month": payout_month,
+            "total_wallets": len(payouts_list),
+            "total_sinn": total_sinn,
+            "total_shares_used": total_shares_used,
+            "payouts": sorted(payouts_list, key=lambda x: x['sinn_to_pay'], reverse=True)
+        }
 
 
 @app.get("/admin/miners")
@@ -740,6 +829,57 @@ def list_miners(admin_key: str, active_only: bool = False):
             }
             for w in wallets
         ]
+
+
+@app.get("/admin/payout_history")
+def get_payout_history(admin_key: str, wallet: Optional[str] = None):
+    """Get payout history, optionally filtered by wallet (admin only)."""
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    with get_db() as db:
+        query = db.query(Payout).order_by(Payout.created_at.desc())
+        
+        if wallet:
+            query = query.filter(Payout.wallet == wallet.lower())
+        
+        payouts = query.limit(100).all()
+        
+        return [
+            {
+                "wallet": p.wallet,
+                "amount": p.amount,
+                "month": p.month,
+                "shares_count": p.shares_count,
+                "tx_hash": p.tx_hash,
+                "created_at": p.created_at.isoformat() if p.created_at else None
+            }
+            for p in payouts
+        ]
+
+
+@app.post("/admin/update_payout_tx")
+def update_payout_tx(admin_key: str, payout_id: int, tx_hash: str):
+    """Update tx_hash for a payout after sending SINN (admin only)."""
+    if admin_key != os.getenv("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    with get_db() as db:
+        payout = db.query(Payout).filter(Payout.id == payout_id).first()
+        
+        if not payout:
+            raise HTTPException(status_code=404, detail="Payout not found")
+        
+        payout.tx_hash = tx_hash
+        
+        # Also update wallet's total_paid
+        wallet = db.query(Wallet).filter(Wallet.address == payout.wallet).first()
+        if wallet:
+            wallet.total_paid += payout.amount
+        
+        db.commit()
+        
+        return {"success": True, "message": f"Payout {payout_id} updated with tx_hash"}
 
 
 # ============================================================
